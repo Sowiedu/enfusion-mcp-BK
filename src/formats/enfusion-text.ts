@@ -15,6 +15,12 @@
 export interface EnfusionProperty {
   key: string;
   value: string | EnfusionNode;
+  /**
+   * Force the string value to be emitted quoted, overriding the bare-identifier
+   * heuristic. Used for fields that are always strings (e.g. a widget Name) whose
+   * value could otherwise be mistaken for a bare enum/identifier.
+   */
+  quoted?: boolean;
 }
 
 /** A node in the Enfusion text tree */
@@ -395,6 +401,15 @@ function escapeString(str: string): string {
     .replace(/\r/g, "\\r");
 }
 
+/**
+ * Format a property key. Plain identifiers are emitted bare; keys containing
+ * spaces or other non-identifier characters (e.g. UI widget properties like
+ * "Blend Mode", "Font Size", "Horizontal Alignment") must be quoted.
+ */
+function formatKey(key: string): string {
+  return /^[A-Za-z_][A-Za-z0-9_.]*$/.test(key) ? key : `"${escapeString(key)}"`;
+}
+
 function serializeNode(node: EnfusionNode, indent: number): string {
   const pad = " ".repeat(indent);
   const innerPad = " ".repeat(indent + 1);
@@ -456,15 +471,19 @@ function serializeNode(node: EnfusionNode, indent: number): string {
   // Properties
   for (const prop of node.properties) {
     if (typeof prop.value === "string") {
-      // Emit bare (unquoted) values for numbers, booleans, and bare identifiers (enums like Manual, Runtime, None)
+      // Emit bare (unquoted) values for numbers, numeric tuples (vectors/colors/anchors),
+      // booleans, and bare identifiers (enums like Manual, Runtime, None) — unless the
+      // property is explicitly flagged to always quote.
       if (
+        !prop.quoted && (
         /^-?\d+(\.\d+)?$/.test(prop.value) ||
+        /^-?\d+(\.\d+)?( -?\d+(\.\d+)?)+$/.test(prop.value) ||
         prop.value === "true" || prop.value === "false" ||
         /^[A-Za-z_][A-Za-z0-9_]*$/.test(prop.value)
-      ) {
-        parts.push(`${innerPad}${prop.key} ${prop.value}`);
+      )) {
+        parts.push(`${innerPad}${formatKey(prop.key)} ${prop.value}`);
       } else {
-        parts.push(`${innerPad}${prop.key} "${escapeString(prop.value)}"`);
+        parts.push(`${innerPad}${formatKey(prop.key)} "${escapeString(prop.value)}"`);
       }
     } else {
       // Value is a child node

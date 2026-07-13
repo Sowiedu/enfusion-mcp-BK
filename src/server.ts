@@ -10,6 +10,8 @@ import { registerMod } from "./tools/mod.js";
 import { registerConfigCreate } from "./tools/config-create.js";
 import { registerServerConfig } from "./tools/server-config.js";
 import { registerLayoutCreate } from "./tools/layout-create.js";
+import { registerLayoutRecipe } from "./tools/layout-recipe.js";
+import { registerGamemodeScaffold } from "./tools/gamemode-scaffold.js";
 import { registerCreateModPrompt } from "./prompts/create-mod.js";
 import { registerModifyModPrompt } from "./prompts/modify-mod.js";
 import { registerClassResource } from "./resources/class-resource.js";
@@ -69,6 +71,8 @@ export function registerTools(server: McpServer, config: Config): void {
   registerConfigCreate(server, config);
   registerServerConfig(server, config);
   registerLayoutCreate(server, config);
+  registerLayoutRecipe(server, config);
+  registerGamemodeScaffold(server, config);
 
   // Workbench Live Control tools (Phase 4)
   const wbClient = new WorkbenchClient(

@@ -6,7 +6,7 @@ import { logger } from "../utils/logger.js";
 export interface PakFileEntry {
   kind: "file";
   name: string;
-  /** Byte offset of this file's data within the DATA chunk payload */
+  /** Absolute byte offset of this file's data within the .pak file */
   offset: number;
   compressedLen: number;
   decompressedLen: number;

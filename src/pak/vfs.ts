@@ -1,6 +1,6 @@
 import { openSync, readSync, closeSync, readdirSync, existsSync } from "node:fs";
 import { join, extname } from "node:path";
-import { inflateRawSync } from "node:zlib";
+import { inflateSync } from "node:zlib";
 import { parsePakIndex, type PakIndex, type PakDirEntry, type PakFileEntry } from "./reader.js";
 import { logger } from "../utils/logger.js";
 
@@ -152,13 +152,14 @@ export class PakVirtualFS {
       throw new Error(`File not found in pak: ${virtualPath}`);
     }
 
-    const { pakPath, dataStart, entry } = ref;
+    const { pakPath, entry } = ref;
     const readLen = entry.compressed ? entry.compressedLen : entry.decompressedLen;
 
     const fd = openSync(pakPath, "r");
     try {
       const buf = Buffer.alloc(readLen);
-      const position = dataStart + entry.offset;
+      // entry.offset is an absolute position within the .pak file
+      const position = entry.offset;
       const bytesRead = readSync(fd, buf, 0, readLen, position);
       if (bytesRead < readLen) {
         throw new Error(
@@ -167,7 +168,8 @@ export class PakVirtualFS {
       }
 
       if (entry.compressed) {
-        return inflateRawSync(buf);
+        // zlib stream with header, not raw deflate
+        return inflateSync(buf);
       }
       return buf;
     } finally {

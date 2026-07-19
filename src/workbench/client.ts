@@ -443,7 +443,9 @@ export class WorkbenchClient {
     //    never be compiled unless the user's project explicitly depends on it.
     let resolvedGproj = gprojPath || this.findFallbackGproj();
     if (resolvedGproj) {
-      this.installHandlerScripts(dirname(resolvedGproj));
+      // Force-overwrite on every launch so a handler bundled by an older version
+      // of this tool cannot linger at the destination and fail to recompile.
+      this.installHandlerScripts(dirname(resolvedGproj), true);
       // Remove any leftover standalone addon to prevent duplicate class errors.
       // If a previous session created {projectPath}/EnfusionMCP/ it would be
       // picked up as a sibling addon and cause compile-time class name conflicts.
@@ -451,7 +453,7 @@ export class WorkbenchClient {
     } else {
       // No project found — fall back to standalone addon as last resort and open it
       // directly so its handlers at least compile (user's project won't be open).
-      this.installHandlerScripts();
+      this.installHandlerScripts(undefined, true);
       const fallbackBase = this.config?.projectPath;
       if (fallbackBase) {
         const standaloneGproj = join(fallbackBase, HANDLER_FOLDER, `${HANDLER_FOLDER}.gproj`);

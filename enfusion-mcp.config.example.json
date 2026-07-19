@@ -1,6 +1,8 @@
 {
   "workbenchPath": "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Arma Reforger Tools",
   "projectPath": "",
+  "workbenchProfileDir": "",
+  "modPaths": [],
   "dataDir": "./data",
   "patternsDir": "./data/patterns"
 }

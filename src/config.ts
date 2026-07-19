@@ -27,6 +27,23 @@ export interface Config {
    *  Automatically set at runtime when wb_launch opens a .gproj file.
    *  Can also be set via ENFUSION_DEFAULT_MOD env var as a static fallback. */
   defaultMod?: string;
+  /** Workbench profile directory used to locate engine logs.
+   *  May point at the "My Games/ArmaReforgerWorkbench" profile folder or
+   *  directly at a logs root that holds the per-session logs_* directories.
+   *  When unset, the logs root is auto-discovered under the user's Documents
+   *  folder (which may be redirected into OneDrive).
+   *  Set via ENFUSION_WORKBENCH_PROFILE_DIR env var. */
+  workbenchProfileDir?: string;
+  /** Extra pak roots (workshop / downloaded mod addon directories) scanned by
+   *  the pak VFS in addition to the base game's addons/ folder. Each entry is a
+   *  directory whose top level and one level deep are searched for .pak files
+   *  (e.g. "My Games/ArmaReforger/addons", where each addon lives in its own
+   *  <AddonName_GUID>/data.pak). The base game always takes precedence on any
+   *  virtual-path collision.
+   *  When unset, the standard mod/addon directories that exist on this machine
+   *  are auto-discovered (empty on machines without the game installed).
+   *  Set via ENFUSION_MOD_PATHS env var (comma- or semicolon-separated). */
+  modPaths?: string[];
 }
 
 const DEFAULT_WORKBENCH_PATH =
@@ -50,6 +67,37 @@ const DEFAULTS: Config = {
   workbenchHost: "127.0.0.1",
   workbenchPort: 5775,
 };
+
+/** Split an ENFUSION_MOD_PATHS value on comma/semicolon, trim, drop empties. */
+function parseModPathsEnv(value: string): string[] {
+  return value
+    .split(/[,;]/)
+    .map((p) => p.trim())
+    .filter((p) => p.length > 0);
+}
+
+/**
+ * Auto-discover the standard mod/addon pak directories present on this machine.
+ * Returns only directories that actually exist, so machines without the game
+ * installed (and CI) get an empty list. The user's Documents folder may be
+ * redirected into OneDrive, so both locations are probed.
+ */
+function discoverModPaths(): string[] {
+  const home = homedir();
+  const candidates = [
+    join(home, "Documents", "My Games", "ArmaReforger", "addons"),
+    join(home, "Documents", "My Games", "ArmaReforgerWorkbench", "addons"),
+    join(home, "OneDrive", "Documents", "My Games", "ArmaReforger", "addons"),
+    join(home, "OneDrive", "Documents", "My Games", "ArmaReforgerWorkbench", "addons"),
+  ];
+  const found: string[] = [];
+  for (const dir of candidates) {
+    if (existsSync(dir) && !found.includes(dir)) {
+      found.push(dir);
+    }
+  }
+  return found;
+}
 
 function loadJsonFile(path: string): Partial<Config> {
   try {
@@ -111,6 +159,18 @@ export function loadConfig(): Config {
   }
   if (process.env.ENFUSION_DEFAULT_MOD) {
     config.defaultMod = process.env.ENFUSION_DEFAULT_MOD;
+  }
+  if (process.env.ENFUSION_WORKBENCH_PROFILE_DIR) {
+    config.workbenchProfileDir = process.env.ENFUSION_WORKBENCH_PROFILE_DIR;
+  }
+
+  // modPaths: auto-discover standard mod/addon dirs unless a config file already
+  // supplied a value; ENFUSION_MOD_PATHS (below) overrides either way.
+  if (config.modPaths === undefined) {
+    config.modPaths = discoverModPaths();
+  }
+  if (process.env.ENFUSION_MOD_PATHS) {
+    config.modPaths = parseModPathsEnv(process.env.ENFUSION_MOD_PATHS);
   }
 
   // Auto-derive gamePath from workbenchPath if not explicitly set

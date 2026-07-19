@@ -17,7 +17,12 @@ import { parsePakIndex } from "../../src/pak/reader.js";
 function buildTestPak(files: Array<{ path: string; content: string; compress: boolean }>): Buffer {
   // ── Build DATA payload and FILE tree simultaneously ────────────────────
   const dataChunks: Buffer[] = [];
-  let dataOffset = 0;
+  // Entry offsets are ABSOLUTE positions within the .pak file, so seed the
+  // running offset with the byte position where the DATA payload begins:
+  // FORM(4) + totalLen(4) + PAC1(4) + HEAD(4) + headLen(4) + headPayload(0x1c)
+  // + DATA(4) + dataLen(4) = 56.
+  const DATA_PAYLOAD_START = 4 + 4 + 4 + 4 + 4 + 0x1c + 4 + 4;
+  let dataOffset = DATA_PAYLOAD_START;
 
   interface TreeFile {
     name: string;

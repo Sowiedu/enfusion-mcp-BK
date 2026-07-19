@@ -2,6 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { existsSync, mkdirSync, writeFileSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { resolve, join, extname, relative } from "node:path";
+import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
 import type { Config } from "../config.js";
 import { generateGproj } from "../templates/gproj.js";
@@ -28,53 +29,116 @@ function findWorkbenchExe(workbenchPath: string): string | null {
   return null;
 }
 
-function runBuild(
+/**
+ * Run a Workbench build and detect completion by TAILING THE ENGINE LOG.
+ *
+ * Workbench is a GUI app: `-buildData` compiles/builds but the process then
+ * stays open in the GUI forever — it never exits on its own. Waiting for
+ * process exit therefore always hits the timeout. Instead we poll console.log
+ * in `logsDir` until the startup/compile completion marker appears and the log
+ * stops growing, then we terminate Workbench ourselves and report from the log.
+ */
+export function runBuild(
   exePath: string,
   args: string[],
+  logsDir: string,
   timeoutMs: number
-): Promise<{ exitCode: number; stdout: string; stderr: string; timedOut: boolean }> {
-  return new Promise((resolve) => {
-    let stdout = "";
+): Promise<{ completed: boolean; killedAfterComplete: boolean; stderr: string; timedOut: boolean; logText: string }> {
+  const POLL_MS = 1000;
+  // After the completion marker, wait for the log to be quiet this long
+  // (covers post-compile build activity that -buildData may still perform).
+  const QUIET_MS = 5000;
+  const COMPLETION_MARKER = /Workbench startup took:|Compiling Game scripts took:/;
+
+  return new Promise((resolvePromise) => {
     let stderr = "";
-    let timedOut = false;
+    let settled = false;
 
     const proc = spawn(exePath, args, {
       windowsHide: true,
     });
 
-    const timer = setTimeout(() => {
-      timedOut = true;
-      proc.kill("SIGTERM");
-    }, timeoutMs);
-
-    proc.stdout.on("data", (data) => {
-      stdout += data.toString();
-    });
-
+    proc.stdout.on("data", () => { /* GUI app — stdout carries nothing useful */ });
     proc.stderr.on("data", (data) => {
       stderr += data.toString();
     });
 
-    proc.on("close", (code) => {
+    const readLog = (): string => {
+      let text = "";
+      for (const logFile of findConsoleLogs(logsDir)) {
+        try {
+          text += readFileSync(logFile, "utf-8") + "\n";
+        } catch {
+          // may be locked mid-write — retry next poll
+        }
+      }
+      return text;
+    };
+
+    const finish = (result: { completed: boolean; killedAfterComplete: boolean; timedOut: boolean }) => {
+      if (settled) return;
+      settled = true;
+      clearInterval(poller);
       clearTimeout(timer);
-      resolve({
-        exitCode: code ?? 1,
-        stdout,
-        stderr,
-        timedOut,
-      });
+      const logText = readLog();
+      if (result.killedAfterComplete || result.timedOut) {
+        try {
+          proc.kill();
+        } catch {
+          // already gone
+        }
+      }
+      resolvePromise({ ...result, stderr, logText });
+    };
+
+    let markerSeen = false;
+    let lastLogLen = -1;
+    let lastGrowth = Date.now();
+
+    const poller = setInterval(() => {
+      const text = readLog();
+      if (text.length !== lastLogLen) {
+        lastLogLen = text.length;
+        lastGrowth = Date.now();
+      }
+      if (!markerSeen && COMPLETION_MARKER.test(text)) {
+        markerSeen = true;
+      }
+      if (markerSeen && Date.now() - lastGrowth >= QUIET_MS) {
+        finish({ completed: true, killedAfterComplete: true, timedOut: false });
+      }
+    }, POLL_MS);
+
+    const timer = setTimeout(() => {
+      finish({ completed: markerSeen, killedAfterComplete: markerSeen, timedOut: true });
+    }, timeoutMs);
+
+    // If the process DOES exit on its own (e.g. fatal error, future versions), use that.
+    proc.on("close", () => {
+      finish({ completed: markerSeen, killedAfterComplete: false, timedOut: false });
     });
 
     proc.on("error", (err) => {
-      clearTimeout(timer);
-      resolve({
-        exitCode: 1,
-        stdout,
-        stderr: stderr + `\nProcess error: ${err.message}`,
-        timedOut: false,
-      });
+      stderr += `\nProcess error: ${err.message}`;
+      finish({ completed: false, killedAfterComplete: false, timedOut: false });
     });
   });
+}
+
+/**
+ * Workbench is a GUI-subsystem app: build progress, script compile errors and
+ * results go to its engine log (console.log), NOT to stdout/stderr. Find all
+ * console.log files under the redirected logs directory.
+ */
+function findConsoleLogs(dir: string): string[] {
+  const out: string[] = [];
+  if (!existsSync(dir)) return out;
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const p = join(dir, entry.name);
+    if (entry.isDirectory()) out.push(...findConsoleLogs(p));
+    else if (entry.name.toLowerCase() === "console.log") out.push(p);
+  }
+  return out;
 }
 
 // ─── create helpers ───────────────────────────────────────────────────────────
@@ -482,9 +546,10 @@ export function registerMod(
           };
         }
 
+        // Program Files is not writable without elevation — default to temp.
         const buildOutput =
           outputPath ||
-          resolve(config.workbenchPath, "addons", addonName, "output");
+          join(tmpdir(), "enfusion-mcp-build", addonName, "output");
 
         const args: string[] = [
           "-wbModule=ResourceManager",
@@ -502,53 +567,116 @@ export function registerMod(
           args.push(`-filterPath`, filterPath);
         }
 
+        // Register the base game data addon. Without this, addon dependencies on
+        // the vanilla game ("ArmaReforger") cannot resolve and Workbench blocks on
+        // a modal "Missing Addon" dialog until the timeout kills the process.
+        const gameAddonsDir = join(config.gamePath, "addons");
+        if (existsSync(gameAddonsDir)) {
+          args.push("-addonsDir", gameAddonsDir);
+        }
+
+        // Redirect the engine log to a directory we control. Workbench is a GUI
+        // app — compile errors and build results only appear in console.log.
+        const logsDir = join(tmpdir(), "enfusion-mcp-build", addonName, `logs-${Date.now()}`);
+        mkdirSync(logsDir, { recursive: true });
+        args.push("-logsDir", logsDir);
+
         try {
           const startTime = Date.now();
-          const result = await runBuild(exePath, args, BUILD_TIMEOUT_MS);
+          const result = await runBuild(exePath, args, logsDir, BUILD_TIMEOUT_MS);
           const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+
+          let logText = result.logText;
+
+          // Fallback: if -logsDir was ignored, scan the default Workbench logs
+          // root for log directories created after we spawned the process.
+          if (!logText.trim()) {
+            const defaultLogsRoot = resolve(config.projectPath, "..", "logs");
+            if (existsSync(defaultLogsRoot)) {
+              for (const entry of readdirSync(defaultLogsRoot, { withFileTypes: true })) {
+                if (!entry.isDirectory()) continue;
+                const dirPath = join(defaultLogsRoot, entry.name);
+                try {
+                  if (statSync(dirPath).mtimeMs < startTime) continue;
+                } catch {
+                  continue;
+                }
+                for (const logFile of findConsoleLogs(dirPath)) {
+                  try {
+                    logText += readFileSync(logFile, "utf-8") + "\n";
+                  } catch {
+                    // locked — skip
+                  }
+                }
+              }
+            }
+          }
+
+          const logLines = logText.split("\n");
+          const scriptErrors = logLines.filter((l) => /SCRIPT\s+\(E\)/.test(l));
+          const engineErrors = logLines.filter((l) => /\w+\s+\(E\)\s*:/.test(l) && !/SCRIPT\s+\(E\)/.test(l));
+          const scriptsCompiled = /Compiling Game scripts took:/.test(logText);
 
           const lines: string[] = [];
           lines.push(`## Build Result: ${addonName}`);
           lines.push("");
 
-          if (result.timedOut) {
-            lines.push(`**Status:** TIMEOUT (exceeded ${BUILD_TIMEOUT_MS / 1000}s limit)`);
-            lines.push("The build process was killed. Try building a smaller scope with filterPath.");
-          } else if (result.exitCode === 0) {
-            lines.push("**Status:** SUCCESS");
-            lines.push(`**Build time:** ${elapsed}s`);
+          if (scriptErrors.length > 0) {
+            lines.push(`**Status:** SCRIPT COMPILE FAILED (${scriptErrors.length} error line(s))`);
+          } else if (result.completed && scriptsCompiled) {
+            lines.push("**Status:** SUCCESS — scripts compiled clean");
             lines.push(`**Output:** ${buildOutput}`);
+          } else if (result.timedOut) {
+            lines.push(`**Status:** TIMEOUT (no completion marker within ${BUILD_TIMEOUT_MS / 1000}s)`);
+            lines.push("Workbench may be blocked on a modal dialog — check the engine log below.");
           } else {
-            lines.push(`**Status:** FAILED (exit code ${result.exitCode})`);
-            lines.push(`**Build time:** ${elapsed}s`);
+            lines.push("**Status:** INCOMPLETE — process ended before the compile finished");
+          }
+          lines.push(`**Build time:** ${elapsed}s`);
+          if (result.killedAfterComplete) {
+            lines.push("_(Workbench does not exit after -buildData; the process was terminated after the log went quiet.)_");
           }
 
           lines.push("");
           lines.push(`**Command:** ${WORKBENCH_DIAG_EXE} ${args.join(" ")}`);
+          lines.push(`**Engine log:** ${logsDir}`);
 
-          if (result.stdout.trim()) {
+          if (scriptErrors.length > 0) {
             lines.push("");
-            lines.push("### Output");
+            lines.push("### Script errors");
             lines.push("```");
-            const stdoutLines = result.stdout.trim().split("\n");
-            const shown = stdoutLines.slice(-100);
-            if (stdoutLines.length > 100) {
-              lines.push(`... (${stdoutLines.length - 100} lines omitted)`);
+            lines.push(scriptErrors.slice(0, 50).join("\n"));
+            if (scriptErrors.length > 50) {
+              lines.push(`... (${scriptErrors.length - 50} more — see engine log)`);
             }
-            lines.push(shown.join("\n"));
+            lines.push("```");
+          }
+
+          if (engineErrors.length > 0) {
+            lines.push("");
+            lines.push("### Engine errors (non-script)");
+            lines.push("```");
+            lines.push(engineErrors.slice(0, 20).join("\n"));
+            if (engineErrors.length > 20) {
+              lines.push(`... (${engineErrors.length - 20} more — see engine log)`);
+            }
+            lines.push("```");
+          }
+
+          if (scriptErrors.length === 0 && !(result.completed && scriptsCompiled) && logText.trim()) {
+            lines.push("");
+            lines.push("### Engine log tail");
+            lines.push("```");
+            lines.push(logLines.filter((l) => l.trim()).slice(-30).join("\n"));
             lines.push("```");
           }
 
           if (result.stderr.trim()) {
             lines.push("");
-            lines.push("### Errors");
+            lines.push("### Process stderr");
             lines.push("```");
             const stderrLines = result.stderr.trim().split("\n");
-            const shown = stderrLines.slice(-50);
-            if (stderrLines.length > 50) {
-              lines.push(`... (${stderrLines.length - 50} lines omitted)`);
-            }
-            lines.push(shown.join("\n"));
+            lines.push(stderrLines.slice(-20).join("\n"));
             lines.push("```");
           }
 

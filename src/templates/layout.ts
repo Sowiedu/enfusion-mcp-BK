@@ -159,6 +159,14 @@ function buildFontNode(font: FontDef): EnfusionNode {
 }
 
 /**
+ * Widget property keys whose values are engine enum tokens, written bare
+ * (unquoted) in .layout files. Verified against the base game's shipped
+ * layouts, where these keys are exclusively bare while string fields like
+ * Text and Font are exclusively quoted.
+ */
+const ENUM_VALUE_KEYS = new Set(["Horizontal Alignment", "Vertical Alignment", "Blend Mode", "Clipping"]);
+
+/**
  * Build an EnfusionNode for a widget. `parentClass` is the resolved widget class
  * of the parent, or null for the root (root gets no id and no slot).
  */
@@ -173,10 +181,12 @@ function buildWidgetNode(widget: WidgetNode, parentClass: string | null): Enfusi
   // Name is always the first property (always quoted — it's a string field).
   node.properties.push({ key: "Name", value: widget.name, quoted: true });
 
-  // Additional widget properties.
+  // Additional widget properties. Enum-valued keys are written as bare tokens
+  // (matching how the engine serializes them in shipped .layout files); string
+  // and resource fields are quoted.
   if (widget.props) {
     for (const [key, value] of Object.entries(widget.props)) {
-      node.properties.push({ key, value });
+      node.properties.push({ key, value, quoted: !ENUM_VALUE_KEYS.has(key) });
     }
   }
 

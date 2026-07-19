@@ -116,9 +116,15 @@ describe("generateLayoutTree", () => {
     expect(out).not.toContain('Anchor "1 0.5 1 0.5"');
   });
 
-  it("quotes multi-word property keys", () => {
+  it("quotes multi-word property keys but keeps enum values bare", () => {
+    // Enum-valued keys are written as bare tokens, matching the engine's own
+    // serialization in shipped .layout files.
     expect(out).toContain('"Blend Mode" Additive');
-    expect(out).not.toContain("\n     Blend Mode Additive");
+    expect(out).not.toContain('"Blend Mode" "Additive"');
+  });
+
+  it("quotes string-valued properties", () => {
+    expect(out).toContain('Texture "{ABC}Images/Icon.edds"');
   });
 
   it("parses back without throwing (valid Enfusion text)", () => {
@@ -152,6 +158,7 @@ describe("generateLayout (flat back-compat API)", () => {
       ],
     });
     expect(out).toContain('Name "Score"');
-    expect(out).toContain("Text 0");
+    // Text is a string field — quoted even when the value looks numeric.
+    expect(out).toContain('Text "0"');
   });
 });

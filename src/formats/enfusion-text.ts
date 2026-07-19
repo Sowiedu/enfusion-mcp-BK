@@ -16,9 +16,15 @@ export interface EnfusionProperty {
   key: string;
   value: string | EnfusionNode;
   /**
-   * Force the string value to be emitted quoted, overriding the bare-identifier
-   * heuristic. Used for fields that are always strings (e.g. a widget Name) whose
-   * value could otherwise be mistaken for a bare enum/identifier.
+   * Whether the string value was (or should be) written quoted in the source.
+   * The parser records this per property so round-trips preserve the exact
+   * quoting of the original file:
+   *   - `true`  — value was a quoted string, emit it quoted.
+   *   - `false` — value was a bare token (number, boolean, enum identifier),
+   *               emit it bare.
+   *   - `undefined` — synthetic value constructed in code with no recorded
+   *               quoting. String values default to quoted; only numeric and
+   *               boolean literals stay bare (see serializeNode).
    */
   quoted?: boolean;
 }
@@ -302,8 +308,8 @@ class Parser {
             const child = this.parseNode();
             node.children.push(child);
           } else {
-            // Key "value" — simple property
-            node.properties.push({ key: identTok.value, value: strTok.value });
+            // Key "value" — simple property with a quoted string value
+            node.properties.push({ key: identTok.value, value: strTok.value, quoted: true });
           }
         } else if (after.type === TokenType.Identifier) {
           // Could be: Key SubNode  (e.g., "Configurations" "GameProjectConfig PC { ... }")
@@ -340,13 +346,13 @@ class Parser {
               node.children.push(child);
             } else {
               // Ident Ident "string" without brace — unusual
-              // Treat first ident as key, rest as value
+              // Treat first ident as key, rest as bare value
               this.pos = saved2;
-              node.properties.push({ key: identTok.value, value: ident2.value });
+              node.properties.push({ key: identTok.value, value: ident2.value, quoted: false });
             }
           } else {
-            // Key BareValue — simple property with unquoted value
-            node.properties.push({ key: identTok.value, value: ident2.value });
+            // Key BareValue — simple property with unquoted (bare) value
+            node.properties.push({ key: identTok.value, value: ident2.value, quoted: false });
           }
         } else if (after.type === TokenType.OpenBrace) {
           // TypeName { ... } — child node with no ID
@@ -410,6 +416,27 @@ function formatKey(key: string): string {
   return /^[A-Za-z_][A-Za-z0-9_.]*$/.test(key) ? key : `"${escapeString(key)}"`;
 }
 
+/** Matches a bare numeric literal or a whitespace-separated numeric tuple (vector/color/anchor). */
+const NUMERIC_TOKEN = /^-?\d+(\.\d+)?( -?\d+(\.\d+)?)*$/;
+
+/**
+ * Decide whether a string-valued property should be emitted bare (unquoted).
+ *
+ * The `quoted` flag recorded by the parser is authoritative for round-tripped
+ * values: `true` forces quotes, `false` forces bare. For synthetic values with
+ * no recorded flag (`undefined`), only numeric and boolean literals stay bare;
+ * every other string defaults to quoted, since quoting is valid wherever a bare
+ * identifier would have been and quoting avoids silently reinterpreting a string
+ * value (e.g. `Name "Foo"`) as a bare token (`Name Foo`).
+ */
+function emitBare(prop: EnfusionProperty): boolean {
+  const value = prop.value as string;
+  if (prop.quoted === true) return false;
+  if (prop.quoted === false) return true;
+  // Synthetic value (quoted === undefined): keep only numbers/tuples/booleans bare.
+  return NUMERIC_TOKEN.test(value) || value === "true" || value === "false";
+}
+
 function serializeNode(node: EnfusionNode, indent: number): string {
   const pad = " ".repeat(indent);
   const innerPad = " ".repeat(indent + 1);
@@ -471,16 +498,7 @@ function serializeNode(node: EnfusionNode, indent: number): string {
   // Properties
   for (const prop of node.properties) {
     if (typeof prop.value === "string") {
-      // Emit bare (unquoted) values for numbers, numeric tuples (vectors/colors/anchors),
-      // booleans, and bare identifiers (enums like Manual, Runtime, None) — unless the
-      // property is explicitly flagged to always quote.
-      if (
-        !prop.quoted && (
-        /^-?\d+(\.\d+)?$/.test(prop.value) ||
-        /^-?\d+(\.\d+)?( -?\d+(\.\d+)?)+$/.test(prop.value) ||
-        prop.value === "true" || prop.value === "false" ||
-        /^[A-Za-z_][A-Za-z0-9_]*$/.test(prop.value)
-      )) {
+      if (emitBare(prop)) {
         parts.push(`${innerPad}${formatKey(prop.key)} ${prop.value}`);
       } else {
         parts.push(`${innerPad}${formatKey(prop.key)} "${escapeString(prop.value)}"`);

@@ -62,7 +62,7 @@ describe("renderRecipe", () => {
     const r = renderRecipe(sample, { text: "Hi", unnamed: "My", fontRef: "{ABC}x.fnt" });
     const out = generateLayoutTree(r.tree);
     expect(out).toContain('Name "MyLabel"');
-    expect(out).toContain("Text Hi");
+    expect(out).toContain('Text "Hi"');
     expect(() => parse(out)).not.toThrow();
   });
 });

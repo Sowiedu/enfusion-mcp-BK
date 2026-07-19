@@ -245,6 +245,57 @@ describe("round-trip", () => {
   });
 });
 
+describe("quoting preservation on round-trip", () => {
+  it("keeps a quoted string value quoted after parse + serialize", () => {
+    const input = `MyNode {\n Name "Foo"\n}`;
+    const node = parse(input);
+    // The parser must record that the value was quoted in the source.
+    expect(node.properties[0].quoted).toBe(true);
+    const output = serialize(node);
+    // Must stay quoted — bare `Name Foo` would silently change file semantics.
+    expect(output).toContain('Name "Foo"');
+    expect(output).not.toMatch(/Name Foo\b/);
+  });
+
+  it("keeps a bare token bare after parse + serialize", () => {
+    const input = `MyNode {\n m_eMode Manual\n m_iCount 5\n m_bFlag true\n}`;
+    const node = parse(input);
+    const mode = node.properties.find((p) => p.key === "m_eMode")!;
+    expect(mode.quoted).toBe(false);
+    const output = serialize(node);
+    expect(output).toContain("m_eMode Manual");
+    expect(output).not.toContain('m_eMode "Manual"');
+    expect(output).toContain("m_iCount 5");
+    expect(output).toContain("m_bFlag true");
+  });
+
+  it("defaults a synthetic string value (no quoted flag) to quoted", () => {
+    const node = createNode("MyNode", {
+      properties: [{ key: "Name", value: "Foo" }],
+    });
+    expect(node.properties[0].quoted).toBeUndefined();
+    const output = serialize(node);
+    expect(output).toContain('Name "Foo"');
+    expect(output).not.toMatch(/Name Foo\b/);
+  });
+
+  it("keeps synthetic numeric and boolean values bare", () => {
+    const node = createNode("MyNode", {
+      properties: [
+        { key: "m_iCount", value: "5" },
+        { key: "m_fScale", value: "1.5" },
+        { key: "m_vColor", value: "0 100 200 255" },
+        { key: "m_bFlag", value: "true" },
+      ],
+    });
+    const output = serialize(node);
+    expect(output).toContain("m_iCount 5");
+    expect(output).toContain("m_fScale 1.5");
+    expect(output).toContain("m_vColor 0 100 200 255");
+    expect(output).toContain("m_bFlag true");
+  });
+});
+
 describe("string escape handling", () => {
   it("should parse \\n escape in string values", () => {
     const input = `MyNode {\n  key "line1\\nline2"\n}`;

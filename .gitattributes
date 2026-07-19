@@ -1,0 +1,3 @@
+# Force LF line endings for test fixture files so fixture-driven tests are
+# reproducible across platforms regardless of a checkout's core.autocrlf setting.
+tests/fixtures/** text eol=lf

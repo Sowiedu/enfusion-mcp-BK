@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import {
   parseAgrToStruct, parseAgfToStruct, parseAstToStruct,
   parseAsiToStruct, parseAwToStruct,
@@ -13,11 +13,19 @@ import { generateSuggestions, formatSuggestions } from "../../src/animation/sugg
 
 const BASE = "C:/Users/Steffen/Documents/My Games/ArmaReforgerWorkbench/profile/TESTANIM";
 
+// These fixtures are a local capture that only exists on the author's machine.
+// When the directory is absent, skip the whole suite (evaluated at collection
+// time) rather than failing. readFile returns an empty string in that case so
+// the collection-time reads and parses registered inside the (skipped) describe
+// blocks do not throw before skipIf takes effect.
+const HAS_FIXTURES = existsSync(BASE);
+
 function readFile(name: string): string {
+  if (!HAS_FIXTURES) return "";
   return readFileSync(`${BASE}/${name}`, "utf-8");
 }
 
-describe("M151A2 Integration", () => {
+describe.skipIf(!HAS_FIXTURES)("M151A2 Integration", () => {
   const agrContent = readFile("M151A2.agr");
   const agfContent = readFile("M151A2.agf");
   const astContent = readFile("M151A2.ast");

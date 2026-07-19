@@ -55,7 +55,7 @@ export function registerGameBrowse(server: McpServer, config: Config): void {
 
         // Merge entries from .pak archives
         try {
-          const pakVfs = PakVirtualFS.get(config.gamePath);
+          const pakVfs = PakVirtualFS.get(config.gamePath, config.modPaths);
           if (pakVfs) {
             const virtualPath = subPath || "";
             const pakEntries = pakVfs.listDir(virtualPath);

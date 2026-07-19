@@ -124,7 +124,7 @@ export function readEtFile(path: string, config: Config, projectPath?: string): 
   }
 
   // 4. Pak VFS
-  const pakVfs = PakVirtualFS.get(config.gamePath);
+  const pakVfs = PakVirtualFS.get(config.gamePath, config.modPaths);
   if (pakVfs && pakVfs.exists(bare)) {
     try { return pakVfs.readTextFile(bare); } catch (e) { logger.debug(`Failed to read pak ${bare}: ${e}`); }
   }

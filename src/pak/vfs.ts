@@ -1,5 +1,5 @@
 import { openSync, readSync, closeSync, readdirSync, existsSync } from "node:fs";
-import { join, extname } from "node:path";
+import { join, extname, resolve } from "node:path";
 import { inflateSync } from "node:zlib";
 import { parsePakIndex, type PakIndex, type PakDirEntry, type PakFileEntry } from "./reader.js";
 import { logger } from "../utils/logger.js";
@@ -22,71 +22,67 @@ interface FileRef {
 // ── PakVirtualFS ─────────────────────────────────────────────────────────────
 
 /**
- * Virtual filesystem that merges all .pak files in the game's addons/ directory
- * into a single unified file tree. Supports directory listing, file existence
- * checks, and on-demand file reading with automatic zlib decompression.
+ * Virtual filesystem that merges all .pak files from the game's addons/ directory
+ * (and any extra mod/addon pak roots) into a single unified file tree. Supports
+ * directory listing, file existence checks, and on-demand file reading with
+ * automatic zlib decompression.
  *
- * Instantiated lazily as a singleton and cached for the session lifetime.
+ * Instances are built lazily and cached per (game path + mod roots) combination
+ * for the session lifetime.
  */
 export class PakVirtualFS {
-  private static instance: PakVirtualFS | null = null;
-  private static instanceGamePath: string | null = null;
+  /** Cache keyed by the composite of game path + mod roots so distinct root
+   *  sets never alias the same instance. */
+  private static cache = new Map<string, PakVirtualFS>();
 
   /** Flat lookup: normalized virtual path → file reference */
   private fileIndex = new Map<string, FileRef>();
   /** Merged directory tree for browsing */
   private root: PakDirEntry = { kind: "dir", name: "", children: new Map() };
 
-  /** Clear the cached VFS instance, forcing a fresh rebuild on next get(). */
+  /** Clear all cached VFS instances, forcing a fresh rebuild on next get(). */
   static invalidate(): void {
-    PakVirtualFS.instance = null;
-    PakVirtualFS.instanceGamePath = null;
+    PakVirtualFS.cache.clear();
+  }
+
+  /** Build the cache key for a given game path and ordered set of mod roots. */
+  private static cacheKey(gamePath: string, modPaths: string[]): string {
+    // Canonicalize each root (absolute form, no trailing separator, casefolded
+    // for Windows's case-insensitive filesystems) so equivalent spellings of
+    // the same directory share one instance. Order is preserved — it defines
+    // collision precedence. NUL never appears in file paths, so it cannot
+    // collide the way a space separator could (Windows paths contain spaces).
+    return [gamePath, ...modPaths]
+      .map((p) => resolve(p).replace(/[\\/]+$/, "").toLowerCase())
+      .join("\u0000");
   }
 
   /**
-   * Get or create the singleton VFS for the given game path.
-   * Returns null if no .pak files are found.
+   * Get or create the cached VFS for the given game path plus optional extra
+   * mod/addon pak roots. The base game's addons/ folder is scanned first, then
+   * each mod root in order; on a virtual-path collision the first-indexed file
+   * wins, so the base game always takes precedence.
+   *
+   * Backwards compatible: called with a single argument it behaves exactly as
+   * before (base game only). Returns null if no .pak files are found anywhere.
    */
-  static get(gamePath: string): PakVirtualFS | null {
-    if (PakVirtualFS.instance && PakVirtualFS.instanceGamePath === gamePath) {
-      return PakVirtualFS.instance;
-    }
+  static get(gamePath: string, modPaths: string[] = []): PakVirtualFS | null {
+    const key = PakVirtualFS.cacheKey(gamePath, modPaths);
+    const cached = PakVirtualFS.cache.get(key);
+    if (cached) return cached;
 
-    const addonsPath = join(gamePath, "addons");
-    if (!existsSync(addonsPath)) return null;
-
-    let pakFiles: string[];
-    try {
-      // Scan addons/ directly, then one level deep (e.g. addons/data/, addons/core/)
-      const topEntries = readdirSync(addonsPath, { withFileTypes: true });
-      pakFiles = topEntries
-        .filter((e) => e.isFile() && extname(e.name).toLowerCase() === ".pak")
-        .map((e) => join(addonsPath, e.name));
-
-      for (const entry of topEntries) {
-        if (!entry.isDirectory()) continue;
-        try {
-          const subEntries = readdirSync(join(addonsPath, entry.name), { withFileTypes: true });
-          for (const sub of subEntries) {
-            if (sub.isFile() && extname(sub.name).toLowerCase() === ".pak") {
-              pakFiles.push(join(addonsPath, entry.name, sub.name));
-            }
-          }
-        } catch {
-          // Skip unreadable subdirectories
-        }
-      }
-
-      pakFiles.sort(); // deterministic order — first pak alphabetically wins on duplicates
-    } catch {
-      return null;
+    // Base game first (its paks win on collisions), then each mod root in order.
+    // Order is preserved across roots — do NOT globally sort, or a mod pak could
+    // shadow a base game pak alphabetically.
+    const pakFiles: string[] = [...scanRootForPaks(join(gamePath, "addons"))];
+    for (const modRoot of modPaths) {
+      pakFiles.push(...scanRootForPaks(modRoot));
     }
 
     if (pakFiles.length === 0) return null;
 
     const vfs = new PakVirtualFS(pakFiles);
-    PakVirtualFS.instance = vfs;
-    PakVirtualFS.instanceGamePath = gamePath;
+    PakVirtualFS.cache.set(key, vfs);
     return vfs;
   }
 
@@ -261,6 +257,44 @@ export class PakVirtualFS {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+/**
+ * Scan a single pak root for .pak files: the root directory itself plus one
+ * level deep (e.g. addons/data/, or addons/<AddonName_GUID>/data.pak). Results
+ * are sorted for deterministic, reproducible order within the root. Returns an
+ * empty array if the root does not exist or cannot be read.
+ */
+function scanRootForPaks(rootPath: string): string[] {
+  if (!existsSync(rootPath)) return [];
+
+  let topEntries;
+  try {
+    topEntries = readdirSync(rootPath, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+
+  const pakFiles: string[] = topEntries
+    .filter((e) => e.isFile() && extname(e.name).toLowerCase() === ".pak")
+    .map((e) => join(rootPath, e.name));
+
+  for (const entry of topEntries) {
+    if (!entry.isDirectory()) continue;
+    try {
+      const subEntries = readdirSync(join(rootPath, entry.name), { withFileTypes: true });
+      for (const sub of subEntries) {
+        if (sub.isFile() && extname(sub.name).toLowerCase() === ".pak") {
+          pakFiles.push(join(rootPath, entry.name, sub.name));
+        }
+      }
+    } catch {
+      // Skip unreadable subdirectories
+    }
+  }
+
+  pakFiles.sort(); // deterministic order — first pak alphabetically wins within a root
+  return pakFiles;
+}
 
 /** Normalize a virtual path: trim slashes, convert backslashes, lowercase. */
 function normalizePath(p: string): string {

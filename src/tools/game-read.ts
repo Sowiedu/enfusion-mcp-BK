@@ -96,7 +96,7 @@ export function registerGameRead(server: McpServer, config: Config): void {
         }
 
         // Fall through to pak VFS
-        const pakVfs = PakVirtualFS.get(config.gamePath);
+        const pakVfs = PakVirtualFS.get(config.gamePath, config.modPaths);
         if (pakVfs && pakVfs.exists(subPath)) {
           const ext = extname(subPath).toLowerCase();
           if (!TEXT_EXTENSIONS.has(ext)) {

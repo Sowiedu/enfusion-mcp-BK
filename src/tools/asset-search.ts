@@ -34,15 +34,29 @@ let cachedBasePath: string | null = null;
 let cachedGuidDiag = "";
 
 /**
+ * Extract {GUID}path.et resource references from an entity-catalog .conf body
+ * into the given map (keyed by lowercased prefab path). Entity catalogs contain
+ * lines like:
+ *   m_sEntityPrefab "{657590C1EC9E27D3}Prefabs/Groups/OPFOR/Group_USSR_LightFireTeam.et"
+ * Later calls overwrite earlier ones for the same path, so the caller controls
+ * precedence by extraction order.
+ */
+function extractCatalogGuids(content: string, into: Map<string, string>): void {
+  const GUID_PATTERN = /\{([0-9A-Fa-f]{16})\}([^\s"]+\.et)/g;
+  let match: RegExpExecArray | null;
+  while ((match = GUID_PATTERN.exec(content)) !== null) {
+    const guid = match[1].toUpperCase();
+    const prefabPath = match[2].replace(/\\/g, "/");
+    into.set(prefabPath.toLowerCase(), guid);
+  }
+}
+
+/**
  * Parse entity catalog .conf files to build a map of normalized prefab path → GUID.
  * Scans loose files under basePath (e.g. addons/data/DataXXX/Configs/EntityCatalog/).
- * Entity catalogs contain lines like:
- *   m_sEntityPrefab "{657590C1EC9E27D3}Prefabs/Groups/OPFOR/Group_USSR_LightFireTeam.et"
  */
-function buildGuidIndex(basePath: string): { guidMap: Map<string, string>; diag: string } {
+function buildGuidIndex(basePath: string): { guidMap: Map<string, string>; catalogCount: number } {
   const guidMap = new Map<string, string>();
-  const GUID_PATTERN = /\{([0-9A-Fa-f]{16})\}([^\s"]+\.et)/g;
-
   let catalogCount = 0;
 
   function walkCatalogs(dir: string): void {
@@ -61,13 +75,7 @@ function buildGuidIndex(basePath: string): { guidMap: Map<string, string>; diag:
         catalogCount++;
         try {
           const content = readFileSync(fullPath, "utf-8");
-          let match: RegExpExecArray | null;
-          GUID_PATTERN.lastIndex = 0;
-          while ((match = GUID_PATTERN.exec(content)) !== null) {
-            const guid = match[1].toUpperCase();
-            const prefabPath = match[2].replace(/\\/g, "/");
-            guidMap.set(prefabPath.toLowerCase(), guid);
-          }
+          extractCatalogGuids(content, guidMap);
         } catch (e) {
           logger.warn(`GUID index: failed to read catalog ${fullPath}: ${e}`);
         }
@@ -76,13 +84,38 @@ function buildGuidIndex(basePath: string): { guidMap: Map<string, string>; diag:
   }
 
   walkCatalogs(basePath);
-
-  const diag = `${guidMap.size} GUIDs from ${catalogCount} catalogs (loose files)`;
-  logger.info(`GUID index built: ${diag}`);
-  return { guidMap, diag };
+  return { guidMap, catalogCount };
 }
 
-function buildIndex(basePath: string, gamePath: string): AssetEntry[] {
+/**
+ * Parse entity-catalog .conf files that live INSIDE pak archives, reading each
+ * through the pak VFS. Any *.conf whose virtual path contains "entitycatalog"
+ * (case-insensitive) is treated as a catalog. A failure on one catalog is logged
+ * and skipped so the rest still index.
+ */
+function buildGuidIndexFromPaks(
+  pakVfs: PakVirtualFS | null
+): { guidMap: Map<string, string>; catalogCount: number } {
+  const guidMap = new Map<string, string>();
+  let catalogCount = 0;
+  if (!pakVfs) return { guidMap, catalogCount };
+
+  for (const vpath of pakVfs.allFilePaths()) {
+    const lower = vpath.toLowerCase();
+    if (!lower.endsWith(".conf") || !lower.includes("entitycatalog")) continue;
+    catalogCount++;
+    try {
+      const content = pakVfs.readTextFile(vpath);
+      extractCatalogGuids(content, guidMap);
+    } catch (e) {
+      logger.warn(`GUID index: failed to read pak catalog ${vpath}: ${e}`);
+    }
+  }
+
+  return { guidMap, catalogCount };
+}
+
+export function buildIndex(basePath: string, gamePath: string, modPaths: string[] = []): AssetEntry[] {
   const start = Date.now();
   const entries: AssetEntry[] = [];
   const seen = new Set<string>();
@@ -115,12 +148,30 @@ function buildIndex(basePath: string, gamePath: string): AssetEntry[] {
 
   walk(basePath);
 
-  // 2. Build GUID index from loose entity catalog files
+  // Resolve the pak VFS once — reused for both catalog extraction and file listing.
+  let pakVfs: PakVirtualFS | null = null;
+  try {
+    pakVfs = PakVirtualFS.get(gamePath, modPaths);
+  } catch (e) {
+    logger.warn(`Failed to open pak VFS: ${e}`);
+  }
+
+  // 2. Build the GUID index. Extract from pak-internal entity catalogs first,
+  //    then overlay loose-file catalogs so loose entries WIN on any conflict.
   let guidMap: Map<string, string> | null = null;
   try {
-    const { guidMap: gm, diag } = buildGuidIndex(basePath);
-    guidMap = gm;
-    cachedGuidDiag = diag;
+    const { guidMap: pakGuids, catalogCount: pakCatalogs } = buildGuidIndexFromPaks(pakVfs);
+    const { guidMap: looseGuids, catalogCount: looseCatalogs } = buildGuidIndex(basePath);
+
+    const merged = new Map(pakGuids);
+    for (const [path, guid] of looseGuids) {
+      merged.set(path, guid); // loose overrides pak on conflict
+    }
+    guidMap = merged;
+    cachedGuidDiag =
+      `${merged.size} GUIDs (loose: ${looseGuids.size} from ${looseCatalogs} catalogs, ` +
+      `pak: ${pakGuids.size} from ${pakCatalogs} catalogs)`;
+    logger.info(`GUID index built: ${cachedGuidDiag}`);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     cachedGuidDiag = `GUID INDEX ERROR: ${msg}`;
@@ -129,7 +180,6 @@ function buildIndex(basePath: string, gamePath: string): AssetEntry[] {
 
   // 3. Add entries from .pak files (skip duplicates already found as loose files)
   try {
-    const pakVfs = PakVirtualFS.get(gamePath);
     if (pakVfs) {
       for (const filePath of pakVfs.allFilePaths()) {
         if (seen.has(filePath.toLowerCase())) continue;
@@ -176,12 +226,15 @@ export function invalidateAssetCache(): void {
   cachedGuidDiag = "";
 }
 
-function getIndex(basePath: string, gamePath: string): AssetEntry[] {
-  if (cachedIndex && cachedBasePath === basePath) {
+function getIndex(basePath: string, gamePath: string, modPaths: string[] = []): AssetEntry[] {
+  // Key the cache on every input that shapes the index, not just the loose
+  // base path — a changed game path or mod-root set must trigger a rebuild.
+  const cacheKey = [basePath, gamePath, ...modPaths].join(" ");
+  if (cachedIndex && cachedBasePath === cacheKey) {
     return cachedIndex;
   }
-  cachedIndex = buildIndex(basePath, gamePath);
-  cachedBasePath = basePath;
+  cachedIndex = buildIndex(basePath, gamePath, modPaths);
+  cachedBasePath = cacheKey;
   return cachedIndex;
 }
 
@@ -232,7 +285,7 @@ export function registerAssetSearch(server: McpServer, config: Config): void {
       }
 
       try {
-        const index = getIndex(basePath, config.gamePath);
+        const index = getIndex(basePath, config.gamePath, config.modPaths);
         const q = query.toLowerCase();
         const allowedExts = type !== "any" ? TYPE_FILTER[type] : null;
 

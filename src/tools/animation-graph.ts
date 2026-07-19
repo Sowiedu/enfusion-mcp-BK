@@ -496,7 +496,7 @@ function readFileForTool(
       if (existsSync(loosePath)) {
         return readFileSync(loosePath, "utf-8");
       }
-      const pakVfs = PakVirtualFS.get(config.gamePath);
+      const pakVfs = PakVirtualFS.get(config.gamePath, config.modPaths);
       if (pakVfs && pakVfs.exists(filePath)) {
         return pakVfs.readFile(filePath).toString("utf-8");
       }
@@ -908,7 +908,7 @@ export function registerAnimationGraph(server: McpServer, config: Config): void 
             if (existsSync(loosePath)) {
               content = readFileSync(loosePath, "utf-8");
             } else {
-              const pakVfs = PakVirtualFS.get(config.gamePath);
+              const pakVfs = PakVirtualFS.get(config.gamePath, config.modPaths);
               if (pakVfs && pakVfs.exists(filePath)) {
                 const buf = pakVfs.readFile(filePath);
                 content = buf.toString("utf-8");

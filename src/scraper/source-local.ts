@@ -51,10 +51,15 @@ export function* readHtmlFromZip(
     if (entry.isDirectory) continue;
     if (!entry.entryName.endsWith(".html")) continue;
 
-    // Strip the prefix directory
-    const filename = entry.entryName.startsWith(prefix)
+    // Strip the prefix directory. Newer (1.7-era) API zips nest all pages
+    // under an extra "html/" folder (e.g. ArmaReforgerScriptAPIPublic/html/
+    // interfaceX.html), whereas older exports placed them directly under the
+    // top-level prefix. Strip the optional "html/" segment so the yielded
+    // filename stays bare (interfaceX.html) for both layouts.
+    let filename = entry.entryName.startsWith(prefix)
       ? entry.entryName.slice(prefix.length)
       : entry.entryName;
+    if (filename.startsWith("html/")) filename = filename.slice("html/".length);
 
     // Apply pattern filter if provided
     if (pattern && !pattern.test(filename)) continue;
@@ -79,8 +84,10 @@ export function readFileFromZip(
   if (!existsSync(zipPath)) return null;
 
   const zip = new AdmZip(zipPath);
-  const fullPath = ZIP_PREFIXES[source] + filename;
-  const entry = zip.getEntry(fullPath);
+  // Try the flat layout first, then the newer "html/" nested layout.
+  const entry =
+    zip.getEntry(ZIP_PREFIXES[source] + filename) ??
+    zip.getEntry(ZIP_PREFIXES[source] + "html/" + filename);
 
   if (!entry) return null;
   return entry.getData().toString("utf-8");

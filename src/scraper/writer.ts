@@ -25,20 +25,61 @@ function writeJson(filePath: string, data: unknown): void {
   logger.info(`Wrote ${filePath}`);
 }
 
+/** Read an existing JSON array file, or return [] if missing/corrupt. */
+function readJsonArray<T>(filePath: string): T[] {
+  if (!existsSync(filePath)) return [];
+  try {
+    return JSON.parse(readFileSync(filePath, "utf-8")) as T[];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Write `classes` unless empty, in which case preserve the existing file.
+ * A source zip that is missing on this machine (e.g. the Enfusion engine API)
+ * yields zero classes; overwriting with [] would destroy good cached data.
+ */
+function writeClassesPreserving(filePath: string, classes: ClassInfo[]): void {
+  if (classes.length === 0) {
+    logger.warn(
+      `No classes scraped for ${filePath} — preserving existing file (source zip likely missing)`
+    );
+    return;
+  }
+  writeJson(filePath, classes);
+}
+
+/** Merge new entries over existing ones by `name`, preserving names not re-scraped. */
+function mergeByName<T extends { name: string }>(existing: T[], scraped: T[]): T[] {
+  const scrapedNames = new Set(scraped.map((e) => e.name));
+  const preserved = existing.filter((e) => !scrapedNames.has(e.name));
+  return [...preserved, ...scraped];
+}
+
 export function writeOutput(dataDir: string, output: ScrapeOutput): void {
   const apiDir = resolve(dataDir, "api");
   const wikiDir = resolve(dataDir, "wiki");
 
+  const enfusionPath = resolve(apiDir, "enfusion-classes.json");
+  const armaPath = resolve(apiDir, "arma-classes.json");
+  const hierarchyPath = resolve(apiDir, "hierarchy.json");
+  const groupsPath = resolve(apiDir, "groups.json");
+
+  writeClassesPreserving(enfusionPath, output.enfusionClasses);
+  writeClassesPreserving(armaPath, output.armaClasses);
+
+  // hierarchy.json / groups.json combine both sources and carry no per-entry
+  // source tag, so a missing source can't be cleanly subtracted. Merge by name:
+  // refresh re-scraped entries, preserve the rest (e.g. Enfusion-only groups).
   writeJson(
-    resolve(apiDir, "enfusion-classes.json"),
-    output.enfusionClasses
+    hierarchyPath,
+    mergeByName(readJsonArray<HierarchyNode>(hierarchyPath), output.hierarchy)
   );
   writeJson(
-    resolve(apiDir, "arma-classes.json"),
-    output.armaClasses
+    groupsPath,
+    mergeByName(readJsonArray<GroupInfo>(groupsPath), output.groups)
   );
-  writeJson(resolve(apiDir, "hierarchy.json"), output.hierarchy);
-  writeJson(resolve(apiDir, "groups.json"), output.groups);
   // Merge wiki pages: preserve existing BI wiki pages, replace only Doxygen-sourced pages
   const pagesPath = resolve(wikiDir, "pages.json");
   let existingPages: WikiPage[] = [];

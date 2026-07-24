@@ -1,88 +1,107 @@
+import { chromium, type Page } from "playwright";
 import { logger } from "../utils/logger.js";
 
-export interface HtmlEntry {
-  filename: string;
-  html: string;
-}
+const BASE_URL = "https://community.bistudio.com/wikidata/external-data/arma-reforger";
+const SUBDIR = {
+  enfusion: "EnfusionScriptAPIPublic",
+  arma: "ArmaReforgerScriptAPIPublic",
+} as const;
+const USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+const CHALLENGE_TITLE = /just a moment|attention required|verifying/i;
+const CHALLENGE_BODY = /Just a moment|cf-browser-verification|challenge-platform/i;
+const CLEARANCE_TIMEOUT_MS = 30_000;
 
-const BASE_URL = "https://arexplorer.zeroy.com/";
-const DELAY_MS = 100;
-const MAX_CONCURRENT = 5;
+export type ApiSource = "enfusion" | "arma";
+
+export interface RemoteFetcher {
+  get(source: ApiSource, filename: string): Promise<string | null>;
+  close(): Promise<void>;
+}
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/**
- * Fetch a single HTML page from the remote Doxygen mirror.
- */
-async function fetchPage(url: string): Promise<string> {
-  const response = await fetch(url, {
-    headers: {
-      "User-Agent":
-        "enfusion-mcp-scraper/0.1.0 (https://github.com/enfusion-mcp)",
-    },
-  });
+async function waitForClearance(page: Page): Promise<boolean> {
+  const deadline = Date.now() + CLEARANCE_TIMEOUT_MS;
 
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status} for ${url}`);
-  }
-
-  return response.text();
-}
-
-/**
- * Fetch the annotated.html class list from the remote source.
- */
-export async function fetchAnnotatedPage(): Promise<string> {
-  logger.info("Fetching class list from arexplorer.zeroy.com");
-  return fetchPage(`${BASE_URL}annotated.html`);
-}
-
-/**
- * Fetch the hierarchy.html page from the remote source.
- */
-export async function fetchHierarchyPage(): Promise<string> {
-  return fetchPage(`${BASE_URL}hierarchy.html`);
-}
-
-/**
- * Fetch multiple class pages with rate limiting.
- * Yields {filename, html} for each successfully fetched page.
- */
-export async function* fetchClassPages(
-  urls: Array<{ name: string; url: string }>
-): AsyncGenerator<HtmlEntry> {
-  let pending: Array<Promise<HtmlEntry | null>> = [];
-
-  for (const { name, url } of urls) {
-    const fullUrl = `${BASE_URL}${url}`;
-
-    const promise = delay(DELAY_MS)
-      .then(() => fetchPage(fullUrl))
-      .then((html) => ({ filename: url, html }) as HtmlEntry)
-      .catch((err) => {
-        logger.warn(`Failed to fetch ${name}: ${err}`);
-        return null;
-      });
-
-    pending.push(promise);
-
-    // Limit concurrency
-    if (pending.length >= MAX_CONCURRENT) {
-      const results = await Promise.all(pending);
-      for (const result of results) {
-        if (result) yield result;
+  while (Date.now() < deadline) {
+    try {
+      const title = await page.title();
+      if (!CHALLENGE_TITLE.test(title)) {
+        return true;
       }
-      pending = [];
+    } catch (error) {
+      logger.warn(`Failed to check Cloudflare clearance: ${error}`);
+      return false;
     }
+
+    await delay(1_000);
   }
 
-  // Flush remaining
-  if (pending.length > 0) {
-    const results = await Promise.all(pending);
-    for (const result of results) {
-      if (result) yield result;
-    }
+  return false;
+}
+
+async function solveChallenge(page: Page, url: string): Promise<boolean> {
+  try {
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
+  } catch (error) {
+    logger.warn(`Failed to open ${url} in browser: ${error}`);
+    return false;
   }
+
+  return waitForClearance(page);
+}
+
+export async function createRemoteFetcher(): Promise<RemoteFetcher> {
+  const browser = await chromium.launch({ headless: true });
+  const context = await browser.newContext({ userAgent: USER_AGENT });
+  const page = await context.newPage();
+  const primeUrl = `${BASE_URL}/${SUBDIR.arma}/index.html`;
+
+  if (!(await solveChallenge(page, primeUrl))) {
+    logger.warn("Cloudflare clearance was not confirmed while priming the remote scraper");
+  }
+
+  return {
+    async get(source: ApiSource, filename: string): Promise<string | null> {
+      const url = `${BASE_URL}/${SUBDIR[source]}/${filename}`;
+
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        let needsClearance = false;
+
+        try {
+          const response = await context.request.get(url, { timeout: 30_000 });
+
+          if (response.status() === 404) {
+            return null;
+          }
+
+          if (response.ok()) {
+            const body = await response.text();
+            if (!CHALLENGE_BODY.test(body)) {
+              return body;
+            }
+            needsClearance = true;
+          } else if (response.status() === 403 || response.status() === 503) {
+            needsClearance = true;
+          }
+        } catch (error) {
+          logger.warn(`Failed to fetch ${url} (attempt ${attempt}/3): ${error}`);
+        }
+
+        if (needsClearance && !(await solveChallenge(page, url))) {
+          logger.warn(`Cloudflare clearance was not confirmed for ${url}`);
+        }
+      }
+
+      logger.warn(`Failed to fetch ${url} after 3 attempts`);
+      return null;
+    },
+
+    async close(): Promise<void> {
+      await browser.close();
+    },
+  };
 }

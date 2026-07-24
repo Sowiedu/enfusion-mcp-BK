@@ -1,5 +1,10 @@
 import { readHtmlFromZip, readFileFromZip } from "./source-local.js";
 import {
+  createRemoteFetcher,
+  type ApiSource,
+  type RemoteFetcher,
+} from "./source-remote.js";
+import {
   parseAnnotatedPage,
   parseClassPage,
   parseHierarchyPage,
@@ -14,6 +19,80 @@ export interface ScrapeOptions {
   source: "local" | "remote";
   workbenchPath: string;
   dataDir: string;
+}
+
+function crossReferenceHierarchy(
+  classes: ClassInfo[],
+  hierarchy: HierarchyNode[]
+): void {
+  // 6. Cross-reference hierarchy with class data.
+  //
+  // The hierarchy parsed from hierarchy.html is the authoritative source for
+  // inheritance relationships.  The <map><area> diagram parser in parseClassPage
+  // is a heuristic that frequently reverses parent/child direction (especially
+  // for root classes with no ancestors), so we override its results with
+  // hierarchy data whenever available.
+  const hChildMap = new Map<string, string[]>();  // parent → children
+  const hParentMap = new Map<string, string[]>(); // child → parents
+
+  for (const node of hierarchy) {
+    for (const child of node.children) {
+      // parent → child
+      let children = hChildMap.get(node.name);
+      if (!children) {
+        children = [];
+        hChildMap.set(node.name, children);
+      }
+      children.push(child);
+
+      // child → parent (inverted)
+      let parents = hParentMap.get(child);
+      if (!parents) {
+        parents = [];
+        hParentMap.set(child, parents);
+      }
+      if (!parents.includes(node.name)) {
+        parents.push(node.name);
+      }
+    }
+  }
+
+  const classesInHierarchy = new Set([...hChildMap.keys(), ...hParentMap.keys()]);
+
+  for (const cls of classes) {
+    if (classesInHierarchy.has(cls.name)) {
+      // Hierarchy data is authoritative — override map-derived relationships
+      cls.parents = hParentMap.get(cls.name) ?? [];
+      cls.children = hChildMap.get(cls.name) ?? [];
+    }
+    // Classes not in the hierarchy keep their map-derived data (best-effort).
+  }
+
+  // 7. Validate: detect and fix circular parent references.
+  //    If A.parents includes B AND B.parents includes A, one direction is wrong.
+  //    Remove the less-likely direction.
+  const classMap = new Map(classes.map((c) => [c.name, c]));
+  for (const cls of classes) {
+    cls.parents = cls.parents.filter((parentName) => {
+      const parentCls = classMap.get(parentName);
+      if (!parentCls) return true; // keep refs to unknown classes
+      if (parentCls.parents.includes(cls.name)) {
+        // Circular reference detected. Use heuristic: SCR_X extends X, not vice versa.
+        // Also: a class with MORE descendants is more likely the parent.
+        const clsIsScr = cls.name.startsWith("SCR_") && !parentName.startsWith("SCR_");
+        if (clsIsScr) return true; // SCR_X extends X — this direction is correct
+        const parentIsScr = parentName.startsWith("SCR_") && !cls.name.startsWith("SCR_");
+        if (parentIsScr) return false; // X says parent is SCR_X — wrong
+        // For non-SCR pairs, keep the one where parent has more children
+        return (parentCls.children.length >= cls.children.length);
+      }
+      return true;
+    });
+  }
+
+  logger.info(
+    `Hierarchy cross-reference: ${classesInHierarchy.size} classes updated from hierarchy data`
+  );
 }
 
 function scrapeLocalSource(
@@ -107,74 +186,109 @@ function scrapeLocalSource(
   }
   logger.info(`Parsed ${wikiPages.length} tutorial pages from ${source}`);
 
-  // 6. Cross-reference hierarchy with class data.
-  //
-  // The hierarchy parsed from hierarchy.html is the authoritative source for
-  // inheritance relationships.  The <map><area> diagram parser in parseClassPage
-  // is a heuristic that frequently reverses parent/child direction (especially
-  // for root classes with no ancestors), so we override its results with
-  // hierarchy data whenever available.
-  const hChildMap = new Map<string, string[]>();  // parent → children
-  const hParentMap = new Map<string, string[]>(); // child → parents
+  crossReferenceHierarchy(classes, hierarchy);
 
-  for (const node of hierarchy) {
-    for (const child of node.children) {
-      // parent → child
-      let children = hChildMap.get(node.name);
-      if (!children) {
-        children = [];
-        hChildMap.set(node.name, children);
-      }
-      children.push(child);
+  return { classes, groups, hierarchy, wikiPages };
+}
 
-      // child → parent (inverted)
-      let parents = hParentMap.get(child);
-      if (!parents) {
-        parents = [];
-        hParentMap.set(child, parents);
-      }
-      if (!parents.includes(node.name)) {
-        parents.push(node.name);
-      }
+async function processWithConcurrency<T>(
+  entries: T[],
+  limit: number,
+  process: (entry: T) => Promise<void>
+): Promise<void> {
+  let nextIndex = 0;
+
+  async function worker(): Promise<void> {
+    while (nextIndex < entries.length) {
+      const entry = entries[nextIndex++];
+      await process(entry);
     }
   }
 
-  const classesInHierarchy = new Set([...hChildMap.keys(), ...hParentMap.keys()]);
+  await Promise.all(
+    Array.from({ length: Math.min(limit, entries.length) }, () => worker())
+  );
+}
 
-  for (const cls of classes) {
-    if (classesInHierarchy.has(cls.name)) {
-      // Hierarchy data is authoritative — override map-derived relationships
-      cls.parents = hParentMap.get(cls.name) ?? [];
-      cls.children = hChildMap.get(cls.name) ?? [];
-    }
-    // Classes not in the hierarchy keep their map-derived data (best-effort).
+export async function scrapeRemoteSource(
+  fetcher: RemoteFetcher,
+  source: ApiSource
+): Promise<{
+  classes: ClassInfo[];
+  groups: GroupInfo[];
+  hierarchy: HierarchyNode[];
+  wikiPages: WikiPage[];
+}> {
+  const classes: ClassInfo[] = [];
+  const groups: GroupInfo[] = [];
+  let hierarchy: HierarchyNode[] = [];
+  const wikiPages: WikiPage[] = [];
+
+  const annotatedHtml = await fetcher.get(source, "annotated.html");
+  if (!annotatedHtml) {
+    logger.error(`Could not fetch annotated.html from remote ${source} source`);
+    return { classes, groups, hierarchy, wikiPages };
   }
 
-  // 7. Validate: detect and fix circular parent references.
-  //    If A.parents includes B AND B.parents includes A, one direction is wrong.
-  //    Remove the less-likely direction.
-  const classMap = new Map(classes.map((c) => [c.name, c]));
-  for (const cls of classes) {
-    cls.parents = cls.parents.filter((parentName) => {
-      const parentCls = classMap.get(parentName);
-      if (!parentCls) return true; // keep refs to unknown classes
-      if (parentCls.parents.includes(cls.name)) {
-        // Circular reference detected. Use heuristic: SCR_X extends X, not vice versa.
-        // Also: a class with MORE descendants is more likely the parent.
-        const clsIsScr = cls.name.startsWith("SCR_") && !parentName.startsWith("SCR_");
-        if (clsIsScr) return true; // SCR_X extends X — this direction is correct
-        const parentIsScr = parentName.startsWith("SCR_") && !cls.name.startsWith("SCR_");
-        if (parentIsScr) return false; // X says parent is SCR_X — wrong
-        // For non-SCR pairs, keep the one where parent has more children
-        return (parentCls.children.length >= cls.children.length);
+  const classList = parseAnnotatedPage(annotatedHtml).filter(
+    (entry) => /^interface[A-Z].*\.html$/.test(entry.url) && !entry.url.includes("-members")
+  );
+  logger.info(`Found ${classList.length} classes in ${source} annotated.html`);
+
+  const hierarchyHtml = await fetcher.get(source, "hierarchy.html");
+  if (hierarchyHtml) {
+    hierarchy = parseHierarchyPage(hierarchyHtml);
+    logger.info(`Parsed ${hierarchy.length} hierarchy nodes from ${source}`);
+  }
+
+  let processed = 0;
+  await processWithConcurrency(classList, 4, async (entry) => {
+    try {
+      const html = await fetcher.get(source, entry.url);
+      if (html) {
+        const classInfo = parseClassPage(html, source, entry.url);
+        if (classInfo.name) {
+          classes.push(classInfo);
+        }
       }
-      return true;
+    } catch (e) {
+      logger.warn(`Failed to parse ${entry.url}: ${e}`);
+    } finally {
+      processed++;
+      if (processed % 200 === 0) {
+        logger.info(`  Parsed ${processed}/${classList.length} class pages from ${source}...`);
+      }
+    }
+  });
+  logger.info(`Parsed ${classes.length} classes from ${source}`);
+
+  let groupIndexHtml = await fetcher.get(source, "topics.html");
+  if (!groupIndexHtml?.trim()) {
+    groupIndexHtml = await fetcher.get(source, "modules.html");
+  }
+
+  if (groupIndexHtml) {
+    const groupFilenames = [
+      ...new Set(groupIndexHtml.match(/group__[A-Za-z0-9_]+\.html/g) ?? []),
+    ];
+
+    await processWithConcurrency(groupFilenames, 4, async (filename) => {
+      try {
+        const html = await fetcher.get(source, filename);
+        if (html) {
+          const group = parseGroupPage(html);
+          if (group.name) {
+            groups.push(group);
+          }
+        }
+      } catch (e) {
+        logger.warn(`Failed to parse group ${filename}: ${e}`);
+      }
     });
   }
+  logger.info(`Parsed ${groups.length} groups from ${source}`);
 
-  logger.info(
-    `Hierarchy cross-reference: ${classesInHierarchy.size} classes updated from hierarchy data`
-  );
+  crossReferenceHierarchy(classes, hierarchy);
 
   return { classes, groups, hierarchy, wikiPages };
 }
@@ -183,8 +297,27 @@ export async function scrape(options: ScrapeOptions): Promise<void> {
   logger.info(`Starting scrape (source: ${options.source})`);
 
   if (options.source === "remote") {
-    logger.error("Remote scraping not yet implemented in Phase 0. Use --source local.");
-    process.exit(1);
+    const fetcher = await createRemoteFetcher();
+    try {
+      logger.info("=== Scraping Enfusion Engine API (remote) ===");
+      const enfusion = await scrapeRemoteSource(fetcher, "enfusion");
+
+      logger.info("=== Scraping Arma Reforger API (remote) ===");
+      const arma = await scrapeRemoteSource(fetcher, "arma");
+
+      const output: ScrapeOutput = {
+        enfusionClasses: enfusion.classes,
+        armaClasses: arma.classes,
+        hierarchy: [...enfusion.hierarchy, ...arma.hierarchy],
+        groups: [...enfusion.groups, ...arma.groups],
+        wikiPages: [...enfusion.wikiPages, ...arma.wikiPages],
+      };
+
+      writeOutput(options.dataDir, output);
+    } finally {
+      await fetcher.close();
+    }
+    return;
   }
 
   // Scrape both API sources from local zips
